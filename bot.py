@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 TELEGRAM AUTOMATION TEST LAB BOT
-Complete bot in a single file - No database, no admin required
-Python 3.12+ | Aiogram 3.x
+Complete bot with health check for Render.com
 """
 
 import os
@@ -11,13 +10,21 @@ import asyncio
 import logging
 import time
 import random
+import threading
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 from enum import Enum
 from collections import Counter
 
-# Third-party imports
+# Flask for health check
+try:
+    from flask import Flask, jsonify
+    FLASK_AVAILABLE = True
+except ImportError:
+    FLASK_AVAILABLE = False
+
+# Telegram imports
 from aiogram import Bot, Dispatcher, Router, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -25,16 +32,21 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+
+# Scheduler
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
+
+# Environment
 from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-
-load_dotenv()
 
 @dataclass
 class Settings:
@@ -159,7 +171,6 @@ class InMemoryStorage:
         self.logs: List[Dict[str, Any]] = []
         self._id_counter = 0
     
-    # User methods
     def get_user(self, telegram_id: int) -> Optional[User]:
         return self.users.get(telegram_id)
     
@@ -187,7 +198,6 @@ class InMemoryStorage:
         return sum(1 for u in self.users.values() 
                   if u.last_active.date() == today)
     
-    # Test methods
     def add_test_run(self, user_id: int, test_name: str, status: TestStatus, 
                      execution_time: float, details: str = None, error: str = None) -> TestRun:
         test_run = TestRun(
@@ -234,7 +244,6 @@ class InMemoryStorage:
         return [{"name": name, "count": count} 
                 for name, count in counter.most_common(limit)]
     
-    # Job methods
     def add_job(self, name: str, description: str) -> ScheduledJob:
         job = ScheduledJob(name=name, description=description)
         self.scheduled_jobs[name] = job
@@ -246,13 +255,6 @@ class InMemoryStorage:
     def get_all_jobs(self) -> List[ScheduledJob]:
         return list(self.scheduled_jobs.values())
     
-    def update_job_status(self, name: str, enabled: bool):
-        job = self.get_job(name)
-        if job:
-            job.enabled = enabled
-            job.status = JobStatus.ENABLED if enabled else JobStatus.DISABLED
-    
-    # Notification methods
     def add_notification(self, user_id: int, message: str, scheduled_for: datetime = None) -> int:
         notification = Notification(
             user_id=user_id,
@@ -275,7 +277,6 @@ class InMemoryStorage:
             "pending": pending
         }
     
-    # Log methods
     def add_log(self, level: str, event: str, user_id: int = None):
         log = {
             "id": self._id_counter,
@@ -937,6 +938,39 @@ async def show_about(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text(text, reply_markup=get_main_menu(), parse_mode="Markdown")
 
 # ============================================================================
+# HEALTH CHECK (Flask)
+# ============================================================================
+
+def run_health_server():
+    """Run Flask health check server for Render."""
+    if not FLASK_AVAILABLE:
+        logger.warning("Flask not available, health check disabled")
+        return
+    
+    app = Flask(__name__)
+    
+    @app.route('/')
+    def index():
+        return "🤖 Telegram Test Bot is running!"
+    
+    @app.route('/health')
+    def health():
+        try:
+            return jsonify({
+                "status": "online",
+                "users": len(storage.users),
+                "tests": len(storage.test_runs),
+                "uptime": "running"
+            })
+        except:
+            return jsonify({"status": "starting"})
+    
+    try:
+        app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
+    except Exception as e:
+        logger.error(f"Health server error: {e}")
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
@@ -947,6 +981,14 @@ scheduler = SchedulerService()
 
 async def main():
     """Main bot entry point."""
+    # Start health server in background
+    if FLASK_AVAILABLE:
+        health_thread = threading.Thread(target=run_health_server, daemon=True)
+        health_thread.start()
+        logger.info("Health check server started on port 8080")
+    else:
+        logger.warning("Health check server disabled (Flask not installed)")
+    
     if not settings.BOT_TOKEN:
         logger.error("BOT_TOKEN not set in environment variables")
         sys.exit(1)
@@ -964,6 +1006,7 @@ async def main():
     logger.info("🤖 Automation Test Lab Bot started!")
     logger.info(f"🔒 Test Mode: {settings.TEST_MODE}")
     logger.info(f"👤 Owner ID: {settings.OWNER_ID}")
+    logger.info(f"🐍 Python Version: {sys.version}")
     
     try:
         await dp.start_polling(bot)
